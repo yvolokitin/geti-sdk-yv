@@ -17,6 +17,7 @@
 import abc
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import cv2
@@ -438,42 +439,141 @@ class MaskToAnnotationConverter(DetectionToPredictionConverter):
         """
         annotations = []
         shape: Polygon | Ellipse
-        for obj in inference_results.segmentedObjects:
-            if obj.score < self.confidence_threshold:
+
+        @dataclass(frozen=True)
+        class _InstanceData:
+            label_value: int | str | None
+            score: float
+            mask: np.ndarray | None
+            contours: Any | None
+            bbox: tuple[float, float, float, float] | None
+
+        def _first_attr(obj: Any, names: tuple[str, ...]) -> Any | None:
+            for name in names:
+                if hasattr(obj, name):
+                    return getattr(obj, name)
+            return None
+
+        def _legacy_instance_data(instance: Any) -> _InstanceData:
+            return _InstanceData(
+                label_value=instance.id,
+                score=instance.score,
+                mask=instance.mask,
+                contours=None,
+                bbox=(instance.xmin, instance.ymin, instance.xmax, instance.ymax),
+            )
+
+        def _new_instance_data(instance: Any) -> _InstanceData | None:
+            label_value = _first_attr(instance, ("label_id", "label", "label_index", "class_id", "category_id", "id"))
+            if label_value is None:
+                return None
+            score = _first_attr(instance, ("score", "confidence", "probability"))
+            if score is None:
+                score = 0.0
+            mask = _first_attr(instance, ("mask", "segmentation"))
+            contours = _first_attr(instance, ("contours", "contour"))
+            bbox = _first_attr(instance, ("bbox", "box"))
+            if bbox is not None and len(bbox) == 4:
+                bbox = tuple(float(value) for value in bbox)
+            else:
+                bbox = None
+            return _InstanceData(
+                label_value=label_value,
+                score=float(score),
+                mask=np.array(mask) if mask is not None else None,
+                contours=contours,
+                bbox=bbox,
+            )
+
+        def _resolve_label(label_value: int | str | None) -> Label | None:
+            if label_value is None:
+                return None
+            if isinstance(label_value, str):
+                return self.get_label_by_str(label_value)
+            return self.get_label_by_idx(int(label_value))
+
+        def _ensure_bbox_from_instance(instance: _InstanceData) -> tuple[float, float, float, float] | None:
+            if instance.bbox is not None:
+                return instance.bbox
+            if instance.mask is None:
+                return None
+            mask_coords = np.column_stack(np.where(instance.mask > 0))
+            if mask_coords.size == 0:
+                return None
+            ymin, xmin = mask_coords.min(axis=0)
+            ymax, xmax = mask_coords.max(axis=0)
+            return float(xmin), float(ymin), float(xmax), float(ymax)
+
+        def _contour_pairs_from_instance(instance: _InstanceData) -> Any | None:
+            if instance.mask is not None:
+                mask = instance.mask.astype(np.uint8)
+                contours, hierarchies = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                if hierarchies is None:
+                    return None
+                return zip(contours, hierarchies[0])
+            if instance.contours is not None:
+                contours = instance.contours
+                if isinstance(contours, np.ndarray):
+                    contours = [contours]
+                return ((contour, [0, 0, 0, -1]) for contour in contours)
+            return None
+
+        if hasattr(inference_results, "segmentedObjects"):
+            # legacy Model API <= 0.2.5.x
+            logging.debug("MaskToAnnotationConverter: using legacy segmentedObjects results.")
+            instances = (_legacy_instance_data(instance) for instance in inference_results.segmentedObjects)
+        else:
+            # new Model API >= 0.2.6
+            logging.debug("MaskToAnnotationConverter: using new instances/objects results.")
+            candidates = _first_attr(inference_results, ("instances", "objects")) or []
+            instances = (data for instance in candidates if (data := _new_instance_data(instance)) is not None)
+
+        for instance in instances:
+            if instance.score < self.confidence_threshold:
                 continue
+            label = _resolve_label(instance.label_value)
+            if label is None or label.is_empty:
+                continue
+
             if self.use_ellipse_shapes:
-                shape = Ellipse(obj.xmin, obj.ymin, obj.xmax - obj.xmin, obj.ymax - obj.ymin)
+                bbox = _ensure_bbox_from_instance(instance)
+                if bbox is None:
+                    continue
+                xmin, ymin, xmax, ymax = bbox
+                shape = Ellipse(float(xmin), float(ymin), float(xmax) - float(xmin), float(ymax) - float(ymin))
                 annotations.append(
                     Annotation(
                         shape=shape,
-                        labels=[ScoredLabel.from_label(self.get_label_by_idx(obj.id), float(obj.score))],
+                        labels=[ScoredLabel.from_label(label, float(instance.score))],
                     )
                 )
-            else:
-                mask = obj.mask.astype(np.uint8)
-                contours, hierarchies = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-                if hierarchies is None:
+                continue
+
+            contour_pairs = _contour_pairs_from_instance(instance)
+            if contour_pairs is None:
+                continue
+            for contour, hierarchy in contour_pairs:
+                if hierarchy[3] != -1:
                     continue
-                for contour, hierarchy in zip(contours, hierarchies[0]):
-                    if hierarchy[3] != -1:
-                        continue
-                    if len(contour) <= 2 or cv2.contourArea(contour) < 1.0:
-                        continue
-                    contour = list(contour)
-                    points = [
-                        Point(
-                            x=point[0][0],
-                            y=point[0][1],
-                        )
-                        for point in contour
-                    ]
-                    shape = Polygon(points=points)
-                    annotations.append(
-                        Annotation(
-                            shape=shape,
-                            labels=[ScoredLabel.from_label(self.get_label_by_idx(obj.id), float(obj.score))],
-                        )
+                if len(contour) <= 2 or cv2.contourArea(contour) < 1.0:
+                    continue
+                contour = np.array(contour)
+                if contour.ndim == 3 and contour.shape[1] == 1:
+                    contour = contour[:, 0, :]
+                points = [
+                    Point(
+                        x=point[0],
+                        y=point[1],
                     )
+                    for point in contour
+                ]
+                shape = Polygon(points=points)
+                annotations.append(
+                    Annotation(
+                        shape=shape,
+                        labels=[ScoredLabel.from_label(label, float(instance.score))],
+                    )
+                )
         return Prediction(annotations)
 
     def convert_saliency_map(
