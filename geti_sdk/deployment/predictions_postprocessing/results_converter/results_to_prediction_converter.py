@@ -17,6 +17,7 @@
 import abc
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import cv2
@@ -438,44 +439,74 @@ class MaskToAnnotationConverter(DetectionToPredictionConverter):
         """
         annotations = []
         shape: Polygon | Ellipse
-        if hasattr(inference_results, "segmentedObjects"):
-            instances = inference_results.segmentedObjects
-        else:
-            instances = getattr(inference_results, "instances", None)
-            if instances is None:
-                instances = getattr(inference_results, "objects", [])
-        for instance in instances:
-            score = getattr(instance, "score", getattr(instance, "confidence", getattr(instance, "probability", 0.0)))
-            if score < self.confidence_threshold:
-                continue
-            label_value = None
-            for attr in ("id", "label_id", "label", "label_index", "class_id", "category_id"):
-                if hasattr(instance, attr):
-                    label_value = getattr(instance, attr)
-                    break
+
+        @dataclass(frozen=True)
+        class _InstanceData:
+            label_value: int | str
+            score: float
+            mask: np.ndarray | None
+            contours: Any | None
+            bbox: tuple[float, float, float, float] | None
+
+        def _first_attr(obj: Any, names: tuple[str, ...]) -> Any | None:
+            for name in names:
+                if hasattr(obj, name):
+                    return getattr(obj, name)
+            return None
+
+        def _legacy_instance_data(instance: Any) -> _InstanceData:
+            return _InstanceData(
+                label_value=instance.id,
+                score=instance.score,
+                mask=instance.mask,
+                contours=None,
+                bbox=(instance.xmin, instance.ymin, instance.xmax, instance.ymax),
+            )
+
+        def _new_instance_data(instance: Any) -> _InstanceData | None:
+            label_value = _first_attr(instance, ("label_id", "label", "label_index", "class_id", "category_id", "id"))
             if label_value is None:
-                continue
-            if isinstance(label_value, str):
-                label = self.get_label_by_str(label_value)
+                return None
+            score = _first_attr(instance, ("score", "confidence", "probability"))
+            if score is None:
+                score = 0.0
+            mask = _first_attr(instance, ("mask", "segmentation"))
+            contours = _first_attr(instance, ("contours", "contour"))
+            bbox = _first_attr(instance, ("bbox", "box"))
+            if bbox is not None and len(bbox) == 4:
+                bbox = tuple(float(value) for value in bbox)
             else:
-                label = self.get_label_by_idx(int(label_value))
-            mask = getattr(instance, "mask", None)
-            if mask is None:
-                mask = getattr(instance, "segmentation", None)
-            contours = getattr(instance, "contours", None)
-            if contours is None:
-                contours = getattr(instance, "contour", None)
+                bbox = None
+            return _InstanceData(
+                label_value=label_value,
+                score=float(score),
+                mask=np.array(mask) if mask is not None else None,
+                contours=contours,
+                bbox=bbox,
+            )
+
+        if hasattr(inference_results, "segmentedObjects"):
+            instances = (_legacy_instance_data(instance) for instance in inference_results.segmentedObjects)
+        else:
+            candidates = _first_attr(inference_results, ("instances", "objects"))
+            if candidates is None:
+                candidates = []
+            instances = (data for instance in candidates if (data := _new_instance_data(instance)) is not None)
+
+        for instance in instances:
+            if instance.score < self.confidence_threshold:
+                continue
+            if isinstance(instance.label_value, str):
+                label = self.get_label_by_str(instance.label_value)
+            else:
+                label = self.get_label_by_idx(int(instance.label_value))
+
             if self.use_ellipse_shapes:
-                xmin = getattr(instance, "xmin", None)
-                ymin = getattr(instance, "ymin", None)
-                xmax = getattr(instance, "xmax", None)
-                ymax = getattr(instance, "ymax", None)
-                if None in (xmin, ymin, xmax, ymax):
-                    bbox = getattr(instance, "bbox", getattr(instance, "box", None))
-                    if bbox is not None and len(bbox) == 4:
-                        xmin, ymin, xmax, ymax = bbox
-                if None in (xmin, ymin, xmax, ymax) and mask is not None:
-                    mask_coords = np.column_stack(np.where(np.array(mask) > 0))
+                xmin = ymin = xmax = ymax = None
+                if instance.bbox is not None:
+                    xmin, ymin, xmax, ymax = instance.bbox
+                elif instance.mask is not None:
+                    mask_coords = np.column_stack(np.where(instance.mask > 0))
                     if mask_coords.size > 0:
                         ymin, xmin = mask_coords.min(axis=0)
                         ymax, xmax = mask_coords.max(axis=0)
@@ -485,21 +516,23 @@ class MaskToAnnotationConverter(DetectionToPredictionConverter):
                 annotations.append(
                     Annotation(
                         shape=shape,
-                        labels=[ScoredLabel.from_label(label, float(score))],
+                        labels=[ScoredLabel.from_label(label, float(instance.score))],
                     )
                 )
             else:
-                if mask is not None:
-                    mask = np.array(mask).astype(np.uint8)
+                contour_pairs = None
+                if instance.mask is not None:
+                    mask = instance.mask.astype(np.uint8)
                     contours, hierarchies = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
                     if hierarchies is None:
                         continue
                     contour_pairs = zip(contours, hierarchies[0])
-                elif contours is not None:
+                elif instance.contours is not None:
+                    contours = instance.contours
                     if isinstance(contours, np.ndarray):
                         contours = [contours]
                     contour_pairs = ((contour, [0, 0, 0, -1]) for contour in contours)
-                else:
+                if contour_pairs is None:
                     continue
                 for contour, hierarchy in contour_pairs:
                     if hierarchy[3] != -1:
@@ -520,7 +553,7 @@ class MaskToAnnotationConverter(DetectionToPredictionConverter):
                     annotations.append(
                         Annotation(
                             shape=shape,
-                            labels=[ScoredLabel.from_label(label, float(score))],
+                            labels=[ScoredLabel.from_label(label, float(instance.score))],
                         )
                     )
         return Prediction(annotations)
